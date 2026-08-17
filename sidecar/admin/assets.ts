@@ -37,7 +37,9 @@ export function serveAdminAsset(request: Request, pathname: string): Response {
 
   const clean = normalizePath(pathname);
   if (clean === "/") {
-    return Response.redirect(new URL("/admin/", request.url), 302);
+    // Relative Location so a bind-address Request.url (0.0.0.0) cannot leak
+    // into the browser address bar behind Zeabur / any reverse proxy.
+    return new Response(null, { status: 302, headers: { location: "/admin/" } });
   }
   if (clean !== "/admin" && !clean.startsWith("/admin/")) return notFound();
 

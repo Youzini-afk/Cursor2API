@@ -68,6 +68,7 @@ import {
 } from "./anthropic";
 import { accountPoolHealth } from "./admin/accounts";
 import { isBackendPath, serveAdminAsset } from "./admin/assets";
+import { nodeRequestUrl } from "./admin/public-url";
 import { initAdmin, shutdownAdmin } from "./admin/init";
 import { beginRequestLog, type RequestLogHandle } from "./admin/logs";
 import { extractPresentedKey, resolveAuth, resolvePassthroughKey } from "./admin/resolve-auth";
@@ -308,20 +309,21 @@ async function cursorModelSelection(requestedModel: string, body: unknown, apiKe
 // paths and the Cloudflare `ExecutionContext`.
 // ---------------------------------------------------------------------------
 
-function healthResponse(port: number): Response {
+function healthResponse(request: Request, port: number): Response {
   let accountsAvailable = 0;
   try {
     accountsAvailable = accountPoolHealth().available;
   } catch {
     accountsAvailable = 0;
   }
+  const url = new URL(request.url);
   return json({
     ok: true,
     service: "api-for-cursor",
-    host: HOST,
+    host: url.host,
     modelCatalog: "live-account-specific",
     sdkVersion: "1.0.27",
-    baseUrl: `http://${HOST}:${port}/v1`,
+    baseUrl: `${url.origin}/v1`,
     adminEnabled: Boolean(process.env.ADMIN_PASSWORD?.trim()),
     accountsAvailable
   });
@@ -1093,7 +1095,7 @@ async function route(request: Request, port: number): Promise<Response> {
   try {
     if (pathname === "/health") {
       if (request.method !== "GET" && request.method !== "HEAD") return notFound();
-      return healthResponse(port);
+      return healthResponse(request, port);
     }
 
     if (pathname === "/api/admin/v1" || pathname.startsWith("/api/admin/v1/")) {
@@ -1152,7 +1154,14 @@ async function route(request: Request, port: number): Promise<Response> {
 
 function toWebRequest(req: IncomingMessage, port: number): Request {
   const method = req.method || "GET";
-  const url = `http://${HOST}:${port}${req.url || "/"}`;
+  const url = nodeRequestUrl({
+    url: req.url,
+    hostHeader: req.headers.host,
+    forwardedHost: req.headers["x-forwarded-host"],
+    forwardedProto: req.headers["x-forwarded-proto"],
+    bindHost: HOST,
+    port
+  });
   const headers = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
     if (value === undefined) continue;

@@ -4,7 +4,8 @@ import { encryptText, sha256Hex } from "../../worker/crypto";
 import { HttpError } from "../../worker/http";
 
 import { checkoutAccount, resetInFlight } from "./accounts";
-import { isBackendPath } from "./assets";
+import { isBackendPath, serveAdminAsset } from "./assets";
+import { nodeRequestUrl } from "./public-url";
 import { handleLogin, initAdminAuth, resetLoginRateLimit } from "./auth";
 import { resetAdminDb } from "./db";
 import { consumeRpm, resetRpmWindows } from "./keys";
@@ -42,6 +43,35 @@ describe("isBackendPath", () => {
     expect(isBackendPath("/api/admin/v1/accounts")).toBe(true);
     expect(isBackendPath("/admin")).toBe(false);
     expect(isBackendPath("/admin/accounts")).toBe(false);
+  });
+});
+
+describe("public request URL", () => {
+  test("uses forwarded host instead of the 0.0.0.0 bind address", () => {
+    expect(nodeRequestUrl({
+      url: "/",
+      hostHeader: "0.0.0.0:8080",
+      forwardedHost: "cursor2api.zeabur.app",
+      forwardedProto: "https",
+      bindHost: "0.0.0.0",
+      port: 8080
+    })).toBe("https://cursor2api.zeabur.app/");
+  });
+
+  test("does not advertise a wildcard bind when Host is missing", () => {
+    expect(nodeRequestUrl({
+      url: "/health",
+      bindHost: "0.0.0.0",
+      port: 8080
+    })).toBe("http://127.0.0.1:8080/health");
+  });
+});
+
+describe("admin root redirect", () => {
+  test("sends a relative Location so browsers stay on the public host", () => {
+    const response = serveAdminAsset(new Request("http://0.0.0.0:8080/"), "/");
+    expect(response.status).toBe(302);
+    expect(response.headers.get("location")).toBe("/admin/");
   });
 });
 
