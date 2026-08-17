@@ -39,6 +39,8 @@
 ```
 cursor2api/
 ├── sidecar/          # 跨平台 API 网关（Responses / Messages / Chat）— Linux 部署核心
+├── sidecar/admin/    # 自建路径的管理 API（SQLite 账号池 / 网关 Key）
+├── admin/            # 管理后台前端（Vite + React，挂在 /admin/）
 ├── scripts/          # SDK Bridge、server.mjs 等
 ├── worker/           # 协议转换逻辑 + Cloudflare Worker
 ├── server.mjs        # 本地启动 CLI（start / stop / claude / codex）
@@ -208,19 +210,25 @@ npm run deploy
 
 **Zeabur / 容器平台**（仓库根目录自带 `Dockerfile`）：
 
-只部署 API 网关（Sidecar + SDK Bridge），不含网页控制台与账号体系（那部分属于 Cloudflare Worker 路径）。
+部署 API 网关（Sidecar + SDK Bridge）以及挂在 `/admin/` 的管理后台。Cloudflare Worker 路径仍然独立，本镜像不会启动它。
 
 1. Zeabur 新建 Service → 选择本仓库，平台检测到根目录 `Dockerfile` 后按 Docker 构建。
-2. 环境变量按需设置，**不要手动设置 `PORT`**（由平台注入）：
+2. 给 Service 挂 Volume 到 `/app/data`（SQLite 账号池与日志）。挂 Volume 后平台无法零停机滚动更新。
+3. 环境变量按需设置，**不要手动设置 `PORT`**（由平台注入）：
 
    | 变量 | 说明 | 建议值 |
    | :-- | :-- | :-- |
+   | `ADMIN_PASSWORD` | 管理后台密码 | **必须设置**，否则 `/api/admin` 返回 503 |
+   | `ENCRYPTION_KEY` | 加密账号池里的 Cursor Key | **必须覆盖**，16+ 随机字符；不要用默认值 |
+   | `ADMIN_SESSION_SECRET` | 签名 cookie 密钥 | 长随机串；不设则重启后要重新登录 |
    | `CURSOR_SDK_BRIDGE_TOKEN` | Sidecar ↔ Bridge 鉴权 Token | 自行生成的长随机串（可留空，容器启动时自动生成） |
-   | `CURSOR_API_KEY` | 默认 Cursor Key | 建议**不设**，让客户端自带 Bearer；设置后需自行加外层鉴权 |
+   | `CURSOR_API_KEY` | 透传模式的回落 Key | 公网建议**不设**，让客户端自带 `crsr_` 或使用 `cmp_` 网关 Key |
    | `CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS` | 单次 SDK 运行超时 | `180000` |
 
-3. Health Check Path 填 `/health`；因 SDK Bridge 冷启动约 10–15 秒，启动探测请留足时间。
-4. 绑定域名后，客户端 Base URL 为 `https://<域名>/v1`（Anthropic 协议用 `https://<域名>`）。
+4. Health Check Path 填 `/health`；因 SDK Bridge 冷启动约 10–15 秒，启动探测请留足时间。
+5. 绑定域名后：客户端 Base URL 为 `https://<域名>/v1`（Anthropic 协议用 `https://<域名>`）；管理后台为 `https://<域名>/admin/`。
+
+鉴权有两条互不干扰的路径：客户端带 `cmp_…` 网关 Key 时从账号池选号；带真实 `crsr_…` Key 时仍原样透传。
 
 容器内进程由 `scripts/start-zeabur.mjs` 前台守护：先起 Node Bridge（仅 `127.0.0.1:8792`，不对外），健康检查通过后再起 Bun Sidecar（`0.0.0.0:$PORT`）；任一进程退出，容器一并退出交由平台重启。
 
@@ -228,12 +236,12 @@ npm run deploy
 
 ```bash
 docker build -t cursor2api .
-docker run --rm -p 8080:8080 cursor2api
+docker run --rm -p 8080:8080 -v cursor2api-data:/app/data -e ADMIN_PASSWORD=change-me -e ENCRYPTION_KEY=replace-with-32-plus-chars cursor2api
 curl http://127.0.0.1:8080/health
 ```
 
 > [!WARNING]
-> Sidecar 自身不带账号体系与限流。公网暴露时请依赖客户端自带 Cursor Key，或在前面加反向代理鉴权；`CURSOR_SDK_BRIDGE_PORT` 仅容器内监听，不要在平台上对外开放。
+> 公网暴露时请设置 `ADMIN_PASSWORD` 与 `ENCRYPTION_KEY`，不要设置裸的 `CURSOR_API_KEY`。`CURSOR_SDK_BRIDGE_PORT` 仅容器内监听，不要在平台上对外开放。
 
 > [!NOTE]
 > 内存态限制：Responses 查询结果、模型缓存与 SDK 会话都在进程内存中，**先按单实例部署**；多副本需要会话粘性与共享存储。

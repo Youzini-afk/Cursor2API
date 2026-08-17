@@ -20,6 +20,13 @@
 
 FROM oven/bun:1-debian AS bun
 
+FROM node:22-trixie-slim AS admin
+WORKDIR /admin
+COPY admin/package.json admin/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY admin/ ./
+RUN npm run build
+
 FROM node:22-trixie-slim AS runtime
 
 WORKDIR /app
@@ -46,10 +53,15 @@ COPY scripts/cursor-sdk-local-agent-bridge.mjs ./scripts/cursor-sdk-local-agent-
 COPY scripts/start-zeabur.mjs ./scripts/start-zeabur.mjs
 COPY sidecar ./sidecar
 COPY worker ./worker
+COPY --from=admin /admin/dist ./admin/dist
 
 # The SDK's local agent runs with a working directory; give it a writable one
 # since /app itself stays root-owned and the process runs as `node`.
-RUN mkdir -p /app/.workspace && chown -R node:node /app/.workspace
+# /app/data holds the admin SQLite file and must be a mounted volume in production.
+RUN mkdir -p /app/.workspace /app/data && chown -R node:node /app/.workspace /app/data
+
+ENV DATA_DIR=/app/data
+VOLUME ["/app/data"]
 
 EXPOSE 8080
 

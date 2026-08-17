@@ -49,7 +49,7 @@ import {
   type OpenAiToolSpec,
   type ToolCallContext
 } from "../worker/openai";
-import { collectCursorOutput, type CursorTextEvent } from "../worker/cursor";
+import { collectCursorOutput } from "../worker/cursor";
 import {
   createCursorSdkCompletion,
   collectCursorSdkOutput,
@@ -66,10 +66,16 @@ import {
   estimateTokens,
   mapModel
 } from "./anthropic";
+import { accountPoolHealth } from "./admin/accounts";
+import { isBackendPath, serveAdminAsset } from "./admin/assets";
+import { initAdmin, shutdownAdmin } from "./admin/init";
+import { beginRequestLog, type RequestLogHandle } from "./admin/logs";
+import { extractPresentedKey, resolveAuth, resolvePassthroughKey } from "./admin/resolve-auth";
+import { handleAdminRoute } from "./admin/routes";
+import type { ResolvedAuth } from "./admin/types";
 
 const HOST = process.env.HOST?.trim() || "127.0.0.1";
 const DEFAULT_PORT = 8787;
-const LOCAL_API_KEY_LITERAL = "cursor-local";
 const PRIMARY_MODEL = "auto";
 
 /**
@@ -165,21 +171,31 @@ function storeResponse(id: string, response: Record<string, unknown>): void {
 }
 
 /**
- * Resolve the Cursor API key for a request. The incoming bearer wins unless it
- * is absent or the local placeholder literal (`cursor-local`), in which case we
- * fall back to `CURSOR_API_KEY` from the environment.
+ * Passthrough-only key resolver. Gateway keys (`cmp_…`) must go through
+ * `resolveAuth` so they can be swapped for a pool account's Cursor key.
  */
 function resolveApiKey(request: Request): string {
-  // Anthropic clients (Claude Code) send the key as `x-api-key`; OpenAI clients use
-  // `Authorization: Bearer`. Either source, with `cursor-local`/empty falling back to the
-  // env key (Credential Manager).
-  const apiKeyHeader = (request.headers.get("x-api-key") || "").trim();
-  const authorization = request.headers.get("authorization") || "";
-  const match = /^Bearer\s+(.+)$/i.exec(authorization.trim());
-  const bearer = match ? match[1].trim() : "";
-  const candidate = apiKeyHeader || bearer;
-  if (candidate && candidate !== LOCAL_API_KEY_LITERAL) return candidate;
-  return (process.env.CURSOR_API_KEY || "").trim();
+  return resolvePassthroughKey(extractPresentedKey(request));
+}
+
+async function withGatewayAuth(
+  request: Request,
+  endpoint: string,
+  missing: () => Response,
+  run: (auth: ResolvedAuth, log: RequestLogHandle) => Promise<Response>
+): Promise<Response> {
+  const auth = await resolveAuth(request);
+  if (!auth) return missing();
+  const log = beginRequestLog({ endpoint, auth });
+  try {
+    const response = await run(auth, log);
+    return log.trackResponse(response);
+  } catch (error) {
+    log.finish({ ok: false, error });
+    throw error;
+  } finally {
+    auth.release?.();
+  }
 }
 
 async function cursorModelSelection(requestedModel: string, body: unknown, apiKey?: string): Promise<{ id: string }> {
@@ -293,13 +309,21 @@ async function cursorModelSelection(requestedModel: string, body: unknown, apiKe
 // ---------------------------------------------------------------------------
 
 function healthResponse(port: number): Response {
+  let accountsAvailable = 0;
+  try {
+    accountsAvailable = accountPoolHealth().available;
+  } catch {
+    accountsAvailable = 0;
+  }
   return json({
     ok: true,
     service: "api-for-cursor",
     host: HOST,
     modelCatalog: "live-account-specific",
     sdkVersion: "1.0.27",
-    baseUrl: `http://${HOST}:${port}/v1`
+    baseUrl: `http://${HOST}:${port}/v1`,
+    adminEnabled: Boolean(process.env.ADMIN_PASSWORD?.trim()),
+    accountsAvailable
   });
 }
 
@@ -421,63 +445,142 @@ function openAiCatalogData(models: CursorCatalogModel[]): Array<Record<string, u
 }
 
 async function handleModels(request: Request): Promise<Response> {
-  const apiKey = resolveApiKey(request);
-  if (!apiKey) return unauthorized();
-  const models = await liveCursorModels(apiKey);
-  return json({ object: "list", data: openAiCatalogData(models) });
+  const auth = await resolveAuth(request);
+  if (!auth) return unauthorized();
+  try {
+    const models = await liveCursorModels(auth.cursorApiKey);
+    return json({ object: "list", data: openAiCatalogData(models) });
+  } finally {
+    auth.release?.();
+  }
 }
 
 async function handleModel(request: Request, id: string): Promise<Response> {
-  const apiKey = resolveApiKey(request);
-  if (!apiKey) return unauthorized();
-  const models = openAiCatalogData(await liveCursorModels(apiKey));
-  const model = models.find((item) => item.id === id);
-  if (!model) return openAiError(`Model '${id}' not found`, 404, "not_found", "model");
-  return json(model);
+  const auth = await resolveAuth(request);
+  if (!auth) return unauthorized();
+  try {
+    const models = openAiCatalogData(await liveCursorModels(auth.cursorApiKey));
+    const model = models.find((item) => item.id === id);
+    if (!model) return openAiError(`Model '${id}' not found`, 404, "not_found", "model");
+    return json(model);
+  } finally {
+    auth.release?.();
+  }
 }
 
 async function handleChatCompletions(request: Request): Promise<Response> {
-  const apiKey = resolveApiKey(request);
-  if (!apiKey) return unauthorized();
+  return withGatewayAuth(request, "/v1/chat/completions", () => unauthorized(), async (auth, log) => {
+    const apiKey = auth.cursorApiKey;
+    const body = await request.json();
+    const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : PRIMARY_MODEL;
+    const cursorModel = await cursorModelSelection(requestedModel, body, apiKey);
+    const prepared = prepareChatRequest(body, cursorModel);
+    log.setMeta({ model: prepared.model, promptChars: prepared.promptChars });
 
-  const body = await request.json();
-  const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : PRIMARY_MODEL;
-  const cursorModel = await cursorModelSelection(requestedModel, body, apiKey);
-  const prepared = prepareChatRequest(body, cursorModel);
+    const id = `chatcmpl_${crypto.randomUUID().replaceAll("-", "")}`;
+    const created = Math.floor(deps.now().getTime() / 1000);
 
-  const id = `chatcmpl_${crypto.randomUUID().replaceAll("-", "")}`;
-  const created = Math.floor(deps.now().getTime() / 1000);
+    if (hasSdkBridge()) {
+      return handleSdkRoute("chat", request, prepared, apiKey, id, created, chatIncrementalPrompt(body, cursorModel), log);
+    }
 
-  if (hasSdkBridge()) {
-    return handleSdkRoute("chat", request, prepared, apiKey, id, created, chatIncrementalPrompt(body, cursorModel));
-  }
+    const completion = await createCursorCompletion(env, deps, apiKey, {
+      prompt: prepared.prompt,
+      model: prepared.cursorModel
+    });
 
-  const completion = await createCursorCompletion(env, deps, apiKey, {
-    prompt: prepared.prompt,
-    model: prepared.cursorModel
-  });
+    if (prepared.stream) {
+      return streamOpenAiResponse("chat", completion.stream, {
+        id,
+        created,
+        model: prepared.model,
+        promptChars: prepared.promptChars,
+        includeUsage: prepared.includeUsage,
+        tools: prepared.tools,
+        context: prepared.toolContext,
+        onDone: (_text, completionChars) => log.finish({ ok: true, completionChars })
+      });
+    }
 
-  if (prepared.stream) {
-    return streamOpenAiResponse("chat", completion.stream, {
-      id,
-      created,
-      model: prepared.model,
-      promptChars: prepared.promptChars,
-      includeUsage: prepared.includeUsage,
+    const output = await collectCursorOutput(completion.stream);
+    const toolCalls = toOpenAiToolCalls({
+      toolCalls: output.toolCalls,
       tools: prepared.tools,
+      responseId: id,
       context: prepared.toolContext
     });
-  }
-
-  const output = await collectCursorOutput(completion.stream);
-  const toolCalls = toOpenAiToolCalls({
-    toolCalls: output.toolCalls,
-    tools: prepared.tools,
-    responseId: id,
-    context: prepared.toolContext
+    log.finish({ ok: true, completionChars: output.text.length });
+    return json(
+      chatCompletionResponse({
+        id,
+        created,
+        model: prepared.model,
+        text: output.text,
+        toolCalls,
+        promptChars: prepared.promptChars,
+        metadata: prepared.responseMetadata
+      })
+    );
   });
-  return json(
-    chatCompletionResponse({
+}
+
+async function handleResponses(request: Request): Promise<Response> {
+  return withGatewayAuth(request, "/v1/responses", () => unauthorized(), async (auth, log) => {
+    const apiKey = auth.cursorApiKey;
+    const body = await request.json();
+    const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : PRIMARY_MODEL;
+    const cursorModel = await cursorModelSelection(requestedModel, body, apiKey);
+    const prepared = prepareResponsesRequest(body, cursorModel);
+    log.setMeta({ model: prepared.model, promptChars: prepared.promptChars });
+
+    const id = `resp_${crypto.randomUUID().replaceAll("-", "")}`;
+    const created = Math.floor(deps.now().getTime() / 1000);
+
+    if (hasSdkBridge()) {
+      return handleSdkRoute("responses", request, prepared, apiKey, id, created, undefined, log);
+    }
+
+    const completion = await createCursorCompletion(env, deps, apiKey, {
+      prompt: prepared.prompt,
+      model: prepared.cursorModel
+    });
+
+    if (prepared.stream) {
+      return streamOpenAiResponse("responses", completion.stream, {
+        id,
+        created,
+        model: prepared.model,
+        promptChars: prepared.promptChars,
+        includeUsage: prepared.includeUsage,
+        metadata: prepared.responseMetadata,
+        tools: prepared.tools,
+        context: prepared.toolContext,
+        onDone: (text, completionChars, toolCalls) => {
+          log.finish({ ok: true, completionChars });
+          storeResponse(
+            id,
+            responseObject({
+              id,
+              created,
+              model: prepared.model,
+              text,
+              toolCalls,
+              promptChars: prepared.promptChars,
+              metadata: prepared.responseMetadata
+            })
+          );
+        }
+      });
+    }
+
+    const output = await collectCursorOutput(completion.stream);
+    const toolCalls = toOpenAiToolCalls({
+      toolCalls: output.toolCalls,
+      tools: prepared.tools,
+      responseId: id,
+      context: prepared.toolContext
+    });
+    const response = responseObject({
       id,
       created,
       model: prepared.model,
@@ -485,76 +588,11 @@ async function handleChatCompletions(request: Request): Promise<Response> {
       toolCalls,
       promptChars: prepared.promptChars,
       metadata: prepared.responseMetadata
-    })
-  );
-}
-
-async function handleResponses(request: Request): Promise<Response> {
-  const apiKey = resolveApiKey(request);
-  if (!apiKey) return unauthorized();
-
-  const body = await request.json();
-  const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : PRIMARY_MODEL;
-  const cursorModel = await cursorModelSelection(requestedModel, body, apiKey);
-  const prepared = prepareResponsesRequest(body, cursorModel);
-
-  const id = `resp_${crypto.randomUUID().replaceAll("-", "")}`;
-  const created = Math.floor(deps.now().getTime() / 1000);
-
-  if (hasSdkBridge()) {
-    return handleSdkRoute("responses", request, prepared, apiKey, id, created);
-  }
-
-  const completion = await createCursorCompletion(env, deps, apiKey, {
-    prompt: prepared.prompt,
-    model: prepared.cursorModel
-  });
-
-  if (prepared.stream) {
-    return streamOpenAiResponse("responses", completion.stream, {
-      id,
-      created,
-      model: prepared.model,
-      promptChars: prepared.promptChars,
-      includeUsage: prepared.includeUsage,
-      metadata: prepared.responseMetadata,
-      tools: prepared.tools,
-      context: prepared.toolContext,
-      onDone: (text, _completionChars, toolCalls) => {
-        storeResponse(
-          id,
-          responseObject({
-            id,
-            created,
-            model: prepared.model,
-            text,
-            toolCalls,
-            promptChars: prepared.promptChars,
-            metadata: prepared.responseMetadata
-          })
-        );
-      }
     });
-  }
-
-  const output = await collectCursorOutput(completion.stream);
-  const toolCalls = toOpenAiToolCalls({
-    toolCalls: output.toolCalls,
-    tools: prepared.tools,
-    responseId: id,
-    context: prepared.toolContext
+    storeResponse(id, response);
+    log.finish({ ok: true, completionChars: output.text.length });
+    return json(response);
   });
-  const response = responseObject({
-    id,
-    created,
-    model: prepared.model,
-    text: output.text,
-    toolCalls,
-    promptChars: prepared.promptChars,
-    metadata: prepared.responseMetadata
-  });
-  storeResponse(id, response);
-  return json(response);
 }
 
 // ---------------------------------------------------------------------------
@@ -679,64 +717,86 @@ function anthropicSseResponse(events: AsyncGenerator<{ event: string; data: Reco
 }
 
 async function handleAnthropicMessages(request: Request): Promise<Response> {
-  const apiKey = resolveApiKey(request);
-  if (!apiKey) return json(anthropicError("Missing or invalid x-api-key.", "authentication_error"), { status: 401 });
-
-  const body = await request.json();
-  const requestedModel =
-    body && typeof body === "object" && typeof (body as { model?: unknown }).model === "string"
-      ? (body as { model: string }).model
-      : PRIMARY_MODEL;
-  const translatedBody = anthropicToChatBody(body);
-  const requestedContext = contextFromAnthropicBeta(request.headers.get("anthropic-beta"));
-  if (requestedContext) translatedBody.cursor_context = requestedContext;
-  const cursorModel = await cursorModelSelection(mapModel(requestedModel), translatedBody, apiKey);
-  const prepared = prepareChatRequest(translatedBody, cursorModel);
-  logToolForwarding("anthropic", prepared);
-  const id = `msg_${crypto.randomUUID().replaceAll("-", "")}`;
-  const inputTokens = estimateTokens(prepared.promptChars);
-
-  // Claude Code resends the full conversation (incl. tool_result) every turn, so /v1/messages is
-  // stateless: a fresh SDK session + full prompt per request, plus the transparent auto-retry.
-  const makeStream = async (_attempt: number): Promise<AsyncIterable<CursorTextEvent>> => {
-    const completion = await createCursorSdkCompletion(env, deps, apiKey, {
-      prompt: prepared.prompt,
-      model: prepared.cursorModel,
-      sessionKey: `cc-${crypto.randomUUID()}`,
-      sessionOwnerKey: sdkSessionOwner(apiKey),
-      workingDirectory: prepared.toolContext?.workingDirectory,
-      clientTools: prepared.tools,
-      requiresLocalTool: prepared.requiresLocalTool,
-      allowToolCall: (toolCall) => sdkAllowToolCall(prepared, toolCall)
-    });
-    return completion.stream;
-  };
-  const stream = retryingSdkStream(makeStream);
-
-  if (prepared.stream) {
-    return anthropicSseResponse(anthropicSseEvents({
-      id,
-      model: requestedModel,
-      inputTokens,
-      stream,
-      tools: prepared.tools,
-      toolContext: prepared.toolContext
-    }));
+  let auth: ResolvedAuth | null;
+  try {
+    auth = await resolveAuth(request);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      return json(
+        anthropicError(error.message, error.status === 401 ? "authentication_error" : "api_error"),
+        { status: error.status }
+      );
+    }
+    throw error;
   }
+  if (!auth) return json(anthropicError("Missing or invalid x-api-key.", "authentication_error"), { status: 401 });
 
-  const output = await collectCursorSdkOutput(stream);
-  return json(
-    anthropicMessage({
-      id,
-      model: requestedModel,
-      text: output.text,
-      toolCalls: output.toolCalls,
-      tools: prepared.tools,
-      toolContext: prepared.toolContext,
-      inputTokens,
-      outputTokens: estimateTokens(output.text.length)
-    })
-  );
+  const apiKey = auth.cursorApiKey;
+  const log = beginRequestLog({ endpoint: "/v1/messages", auth });
+  try {
+    const body = await request.json();
+    const requestedModel =
+      body && typeof body === "object" && typeof (body as { model?: unknown }).model === "string"
+        ? (body as { model: string }).model
+        : PRIMARY_MODEL;
+    const translatedBody = anthropicToChatBody(body);
+    const requestedContext = contextFromAnthropicBeta(request.headers.get("anthropic-beta"));
+    if (requestedContext) translatedBody.cursor_context = requestedContext;
+    const cursorModel = await cursorModelSelection(mapModel(requestedModel), translatedBody, apiKey);
+    const prepared = prepareChatRequest(translatedBody, cursorModel);
+    log.setMeta({ model: requestedModel, promptChars: prepared.promptChars });
+    logToolForwarding("anthropic", prepared);
+    const id = `msg_${crypto.randomUUID().replaceAll("-", "")}`;
+    const inputTokens = estimateTokens(prepared.promptChars);
+
+    // Claude Code resends the full conversation (incl. tool_result) every turn, so /v1/messages is
+    // stateless: a fresh SDK session + full prompt per request, plus the transparent auto-retry.
+    const makeStream = async (_attempt: number): Promise<AsyncIterable<CursorTextEvent>> => {
+      const completion = await createCursorSdkCompletion(env, deps, apiKey, {
+        prompt: prepared.prompt,
+        model: prepared.cursorModel,
+        sessionKey: `cc-${crypto.randomUUID()}`,
+        sessionOwnerKey: sdkSessionOwner(apiKey),
+        workingDirectory: prepared.toolContext?.workingDirectory,
+        clientTools: prepared.tools,
+        requiresLocalTool: prepared.requiresLocalTool,
+        allowToolCall: (toolCall) => sdkAllowToolCall(prepared, toolCall)
+      });
+      return completion.stream;
+    };
+    const stream = retryingSdkStream(makeStream);
+
+    if (prepared.stream) {
+      return log.trackResponse(anthropicSseResponse(anthropicSseEvents({
+        id,
+        model: requestedModel,
+        inputTokens,
+        stream,
+        tools: prepared.tools,
+        toolContext: prepared.toolContext
+      })));
+    }
+
+    const output = await collectCursorSdkOutput(stream);
+    log.finish({ ok: true, completionChars: output.text.length });
+    return json(
+      anthropicMessage({
+        id,
+        model: requestedModel,
+        text: output.text,
+        toolCalls: output.toolCalls,
+        tools: prepared.tools,
+        toolContext: prepared.toolContext,
+        inputTokens,
+        outputTokens: estimateTokens(output.text.length)
+      })
+    );
+  } catch (error) {
+    log.finish({ ok: false, error });
+    throw error;
+  } finally {
+    auth.release?.();
+  }
 }
 
 /** `POST /v1/messages/count_tokens` — Claude Code's pre-send estimate. Same body shape as
@@ -755,7 +815,8 @@ async function handleSdkRoute(
   apiKey: string,
   id: string,
   created: number,
-  incrementalPrompt?: ReturnType<typeof prepareChatRequest>["prompt"]
+  incrementalPrompt?: ReturnType<typeof prepareChatRequest>["prompt"],
+  log?: RequestLogHandle
 ): Promise<Response> {
   logToolForwarding(kind, prepared);
   // Maintain one SDK agent per client session "under the hood": attempt 0 reuses the
@@ -791,7 +852,8 @@ async function handleSdkRoute(
       metadata: prepared.responseMetadata,
       tools: prepared.tools,
       context: prepared.toolContext,
-      onDone: (text, _completionChars, toolCalls) => {
+      onDone: (text, completionChars, toolCalls) => {
+        log?.finish({ ok: true, completionChars });
         if (kind === "responses") {
           storeResponse(
             id,
@@ -817,6 +879,7 @@ async function handleSdkRoute(
     responseId: id,
     context: prepared.toolContext
   });
+  log?.finish({ ok: true, completionChars: output.text.length });
 
   if (kind === "chat") {
     return json(
@@ -1018,8 +1081,8 @@ async function route(request: Request, port: number): Promise<Response> {
       status: 204,
       headers: {
         "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
-        "access-control-allow-headers": "authorization,content-type,x-api-key"
+        "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+        "access-control-allow-headers": "authorization,content-type,x-api-key,cookie"
       }
     });
   }
@@ -1031,6 +1094,10 @@ async function route(request: Request, port: number): Promise<Response> {
     if (pathname === "/health") {
       if (request.method !== "GET" && request.method !== "HEAD") return notFound();
       return healthResponse(port);
+    }
+
+    if (pathname === "/api/admin/v1" || pathname.startsWith("/api/admin/v1/")) {
+      return await handleAdminRoute(request, pathname);
     }
 
     const v1Path = pathname.startsWith("/v1/") ? pathname.slice(3) : pathname === "/v1" ? "/" : "";
@@ -1071,7 +1138,9 @@ async function route(request: Request, port: number): Promise<Response> {
       return handleResponseState(request, decodeURIComponent(responseMatch[1]));
     }
 
-    return notFound();
+    // Backend prefixes must never be swallowed by the admin SPA fallback.
+    if (isBackendPath(pathname)) return notFound();
+    return serveAdminAsset(request, pathname);
   } catch (error) {
     return errorResponse(error);
   }
@@ -1154,6 +1223,19 @@ function parsePort(): number {
 
 function main(): void {
   const port = parsePort();
+  initAdmin(env, deps);
+  const shutdown = () => {
+    shutdownAdmin();
+  };
+  process.on("SIGTERM", () => {
+    shutdown();
+    process.exit(0);
+  });
+  process.on("SIGINT", () => {
+    shutdown();
+    process.exit(0);
+  });
+
   const server = createServer((req, res) => {
     const request = toWebRequest(req, port);
     route(request, port)
@@ -1169,6 +1251,7 @@ function main(): void {
 
   server.listen(port, HOST, () => {
     console.log(`API for Cursor server running at http://${HOST}:${port}/v1`);
+    console.log(`Admin console at http://${HOST}:${port}/admin/`);
   });
 }
 

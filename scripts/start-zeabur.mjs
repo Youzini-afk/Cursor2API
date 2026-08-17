@@ -219,7 +219,7 @@ async function main() {
     return;
   }
 
-  log(`ready on port ${publicPort} — OpenAI: /v1, Anthropic: /, health: /health`);
+  log(`ready on port ${publicPort} — OpenAI: /v1, Anthropic: /, admin: /admin/, health: /health`);
 }
 
 main().catch((error) => {

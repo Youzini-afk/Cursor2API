@@ -27,6 +27,7 @@ credentials.json
 .local/
 .runtime/
 .cursor2api/
+data/
 CursorApiBridge*/
 
 # Lab / working copies & agent config backups
