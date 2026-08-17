@@ -246,7 +246,7 @@ curl http://127.0.0.1:8080/health
 > [!NOTE]
 > 内存态限制：Responses 查询结果、模型缓存与 SDK 会话都在进程内存中，**先按单实例部署**；多副本需要会话粘性与共享存储。
 
-若构建阶段 `npm ci` 拉包失败：当前 `package-lock.json` 中 `@cursor/sdk` 系列包的 `resolved` 指向 `registry.npmmirror.com`，构建环境需能访问该镜像；否则在本地用官方源重新生成 lock（`npm install --registry=https://registry.npmjs.org`）后提交。
+若构建阶段 `npm ci` 拉包失败：先确认根目录 `package-lock.json` 与 `package.json` 同步（`npm ci` 在不同步时会直接失败），且 lock 里的 `resolved` 指向 `registry.npmjs.org`。用官方源重生成：`npm install --package-lock-only --registry=https://registry.npmjs.org`。
 
 ## 客户端接入
 

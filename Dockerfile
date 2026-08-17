@@ -46,6 +46,9 @@ COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 
 # Only the bridge needs npm dependencies; the sidecar and worker helpers have none.
 COPY package.json package-lock.json ./
+# npm ci uses `resolved` URLs from the lockfile; keep the default registry on
+# npmjs so a China-mirror entry cannot break overseas builders (Zeabur).
+ENV NPM_CONFIG_REGISTRY=https://registry.npmjs.org
 RUN npm ci --omit=dev --no-audit --no-fund \
     && npm cache clean --force
 
