@@ -13,6 +13,7 @@
     "url": "https://github.com/NGLSG/cursor2api/issues"
   },
   "scripts": {
+    "start": "node scripts/start-zeabur.mjs",
     "server": "node server.mjs",
     "start:local": "node server.mjs start",
     "stop:local": "node server.mjs stop",

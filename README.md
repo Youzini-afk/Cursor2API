@@ -127,7 +127,7 @@ Sidecar 负责三种协议的入站解析与出站整形；SDK Bridge 用官方 
 
 | 依赖 | 版本 |
 | :-- | :-- |
-| Node.js | 20+（SDK Bridge **必须**用 Node） |
+| Node.js | 22.13+（`@cursor/sdk` 的 `engines` 要求；SDK Bridge **必须**用 Node） |
 | Bun | 1.3+（Sidecar 服务） |
 | Cursor 账号 | 已开通 API / Composer 权限 |
 
@@ -205,6 +205,40 @@ npm run deploy
 ```
 
 **自建 VPS / Linux**：与本地相同，启动 sidecar + bridge 后用 systemd 或 Docker 守护进程即可。
+
+**Zeabur / 容器平台**（仓库根目录自带 `Dockerfile`）：
+
+只部署 API 网关（Sidecar + SDK Bridge），不含网页控制台与账号体系（那部分属于 Cloudflare Worker 路径）。
+
+1. Zeabur 新建 Service → 选择本仓库，平台检测到根目录 `Dockerfile` 后按 Docker 构建。
+2. 环境变量按需设置，**不要手动设置 `PORT`**（由平台注入）：
+
+   | 变量 | 说明 | 建议值 |
+   | :-- | :-- | :-- |
+   | `CURSOR_SDK_BRIDGE_TOKEN` | Sidecar ↔ Bridge 鉴权 Token | 自行生成的长随机串（可留空，容器启动时自动生成） |
+   | `CURSOR_API_KEY` | 默认 Cursor Key | 建议**不设**，让客户端自带 Bearer；设置后需自行加外层鉴权 |
+   | `CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS` | 单次 SDK 运行超时 | `180000` |
+
+3. Health Check Path 填 `/health`；因 SDK Bridge 冷启动约 10–15 秒，启动探测请留足时间。
+4. 绑定域名后，客户端 Base URL 为 `https://<域名>/v1`（Anthropic 协议用 `https://<域名>`）。
+
+容器内进程由 `scripts/start-zeabur.mjs` 前台守护：先起 Node Bridge（仅 `127.0.0.1:8792`，不对外），健康检查通过后再起 Bun Sidecar（`0.0.0.0:$PORT`）；任一进程退出，容器一并退出交由平台重启。
+
+本地等价验证：
+
+```bash
+docker build -t cursor2api .
+docker run --rm -p 8080:8080 cursor2api
+curl http://127.0.0.1:8080/health
+```
+
+> [!WARNING]
+> Sidecar 自身不带账号体系与限流。公网暴露时请依赖客户端自带 Cursor Key，或在前面加反向代理鉴权；`CURSOR_SDK_BRIDGE_PORT` 仅容器内监听，不要在平台上对外开放。
+
+> [!NOTE]
+> 内存态限制：Responses 查询结果、模型缓存与 SDK 会话都在进程内存中，**先按单实例部署**；多副本需要会话粘性与共享存储。
+
+若构建阶段 `npm ci` 拉包失败：当前 `package-lock.json` 中 `@cursor/sdk` 系列包的 `resolved` 指向 `registry.npmmirror.com`，构建环境需能访问该镜像；否则在本地用官方源重新生成 lock（`npm install --registry=https://registry.npmjs.org`）后提交。
 
 ## 客户端接入
 

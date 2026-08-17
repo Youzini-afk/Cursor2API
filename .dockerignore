@@ -1,0 +1,51 @@
+# Keep the build context small: the image only needs package manifests,
+# scripts/, sidecar/ and worker/.
+
+.git
+.github
+.gitignore
+node_modules
+dist
+.wrangler
+.mf
+.vite
+coverage
+.nyc_output
+
+# Frontend + desktop app: not part of the API gateway image.
+desktop
+docs
+public
+src
+index.html
+vite.config.ts
+vitest.config.ts
+
+# Cloudflare-only assets.
+migrations
+wrangler.jsonc
+
+# Tests and type-check-only config.
+**/*.test.ts
+tsconfig.json
+
+# Secrets and local runtime state must never reach the image.
+.env
+.env.*
+.dev.vars
+*.key
+*.pem
+*.pfx
+*.p12
+credentials.json
+**/secrets.json
+*.log
+.cursor2api
+.runtime
+.local
+
+# Editor / OS noise.
+.idea
+.vscode
+.DS_Store
+Thumbs.db
